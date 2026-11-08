@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+outputs/
+.last_remote.json
+*.log
+.DS_Store
