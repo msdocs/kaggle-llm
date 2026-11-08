@@ -5,6 +5,8 @@ Run open LLMs from [Kaggle Models](https://www.kaggle.com/models) in one of two 
 - **local**: download the model with `kagglehub` and run it on Apple Silicon with [MLX](https://github.com/ml-explore/mlx-lm)
 - **remote**: push a private GPU notebook to Kaggle (free T4/P100, about 30 hrs/week), wait for it to finish, and print the answer
 
+It's also the backend for [Parley](https://mahmoud.sh/parley/), a desktop chat app for macOS.
+
 ## Setup
 
 ```bash
