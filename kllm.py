@@ -24,6 +24,7 @@ DEFAULTS = {"local": "qwen-lm/qwen-3/transformers/1.7b",   # light enough for a 
             "remote": "qwen-lm/qwen-3/transformers/4b"}    # ~8GB fp16, fits a Kaggle T4
 # Sampling settings recommended for Qwen 3; greedy decoding makes it loop.
 TEMP, TOP_P = 0.6, 0.95
+REGION = "us-en"  # keep web results in one language/region
 
 
 class KllmError(Exception):
@@ -48,6 +49,150 @@ def download(handle):
         patched._kllm_patched = True
         KaggleHttpClient._prepare_response = patched
     return kagglehub.model_download(handle)
+
+
+# ---------------------------------------------------------------- web search
+
+def search_query(messages):
+    """Search for the latest user message; prepend the previous one if it's a short follow-up."""
+    users = [m["content"].replace("/no_think", "").replace("/think", "").strip()
+             for m in messages if m["role"] == "user"]
+    if not users:
+        return ""
+    q = strip_search_phrasing(users[-1])
+    if len(q.split()) < 5 and len(users) > 1:
+        q = strip_search_phrasing(users[-2])[:150] + " " + q
+    return q[:300]
+
+
+def strip_search_phrasing(q):
+    """'search the web for penguins' -> 'penguins'. Search engines choke on the instruction words."""
+    import re
+    q = re.sub(r"^\s*(please\s+)?(can you\s+|could you\s+)?((do a\s+)?(web\s+)?search|google|look\s+up|"
+               r"find( me)?|browse)(\s+the\s+(web|internet|net))?(\s+(for|about|on))?\s*[:,-]?\s*",
+               "", q, flags=re.I)
+    return q.strip(" ?.!") or q
+
+
+def web_search(query, n=5, chars=2500, on_status=lambda s: None):
+    """DuckDuckGo search, then fetch and extract the text of each result page in parallel.
+    Falls back to the search snippet when a page can't be read."""
+    from concurrent.futures import ThreadPoolExecutor
+    import requests, trafilatura
+    from ddgs import DDGS
+
+    on_status("Searching the web…")
+    hits = []
+    # Retry with a shorter query if the full one finds nothing (ddgs raises on zero results).
+    for q in dict.fromkeys([query, " ".join(query.split()[:8])]):
+        try:
+            hits = DDGS().text(q, region=REGION, max_results=n) or []
+        except Exception as e:
+            if "no results" not in str(e).lower():
+                raise
+        if hits:
+            break
+    if not hits:
+        raise KllmError(f'no results for "{query}"')
+    on_status(f"Reading {len(hits)} pages…")
+
+    def fetch_html(hit):
+        try:
+            r = requests.get(hit["href"], timeout=8, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                              "(KHTML, like Gecko) Version/18.0 Safari/605.1.15"})
+            if r.ok and "html" in r.headers.get("Content-Type", ""):
+                return r.text[:2_000_000]
+        except Exception:
+            pass
+        return ""
+
+    # Download in parallel, but extract text one page at a time: lxml's HTML parser
+    # (used by trafilatura) is not thread-safe and aborts the process if run concurrently.
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        pages = list(ex.map(fetch_html, hits))
+    results = []
+    for hit, html in zip(hits, pages):
+        text = ""
+        if html:
+            try:
+                text = trafilatura.extract(html, include_comments=False, include_tables=True) or ""
+            except Exception:
+                pass
+        text = " ".join(text.split()) or hit.get("body", "")
+        results.append({"title": hit.get("title") or hit["href"], "url": hit["href"],
+                        "text": text[:chars] + ("…" if len(text) > chars else "")})
+    return results
+
+
+IMAGE_WORDS = r"\b(images?|pictures?|photos?|pics|wallpapers?|gifs?)\b"
+
+
+def wants_images(query):
+    import re
+    return bool(re.search(IMAGE_WORDS, query, re.I))
+
+
+def image_query(query):
+    """'images of cats' -> 'cats'; 'cute cat pictures' -> 'cute cat'."""
+    import re
+    q = re.sub(IMAGE_WORDS + r"(\s+(of|for|about|showing))?", " ", query, flags=re.I)
+    q = re.sub(r"^\s*((show|give|get|find|display|send)\s+)?(me\s+)?((some|a few|any|the|more)\s+)?",
+               "", " ".join(q.split()), flags=re.I)
+    return q.strip() or query
+
+
+def image_search(query, n=12):
+    from ddgs import DDGS
+    hits = DDGS().images(image_query(query), region=REGION, safesearch="moderate", max_results=n) or []
+    return [{"title": h.get("title", ""), "thumbnail": h["thumbnail"], "image": h.get("image", ""),
+             "url": h.get("url") or h.get("image", ""), "source": h.get("source", "")}
+            for h in hits if h.get("thumbnail", "").startswith("https://")]
+
+
+def with_web_context(messages, results, images=()):
+    """Return messages with the search results attached to the latest user message.
+    (Small models largely ignore a separate system message, and tend to claim they
+    "can't browse" unless told plainly that the results came from a search.)"""
+    if not results and not images:
+        return messages
+    parts = [f"Today's date is {time.strftime('%B %-d, %Y')}. You DO have web access: the app just "
+             "searched the web for the message below, and the results are included here. Do not say "
+             "you can't browse, search, or show images."]
+    if images:
+        parts.append(f"The app is already showing the user a grid of {len(images)} image results above your "
+                     "reply. Introduce them in one or two sentences; don't list or describe each image or site.")
+    if results:
+        parts.append("Use these web results when relevant and cite them inline like [1] or [2]. If they "
+                     "don't answer the question, say so. Prefer them over your own memory for recent facts.\n\n"
+                     + "\n\n".join(f"[{i}] {r['title']}\n{r['url']}\n{r['text']}" for i, r in enumerate(results, 1)))
+    msgs = [dict(m) for m in messages]
+    last = max(i for i, m in enumerate(msgs) if m["role"] == "user")
+    msgs[last]["content"] = ("<web_search_results>\n" + "\n\n".join(parts) + "\n</web_search_results>\n\n"
+                             + "User message: " + msgs[last]["content"])
+    return msgs
+
+
+def search_for_chat(messages, emit):
+    """Run a web search (plus an image search when asked for images) for a chat request,
+    reporting progress, sources and images through emit(). Returns the messages with
+    results added (or unchanged if the search failed)."""
+    query = search_query(messages)
+    images = []
+    if wants_images(query):
+        emit(type="status", text="Searching for images…")
+        try:
+            images = image_search(query)
+        except Exception:
+            images = []
+        emit(type="images", items=images)
+    try:
+        results = web_search(query, on_status=lambda s: emit(type="status", text=s))
+    except Exception as e:
+        emit(type="sources", items=[], error="" if images else f"Web search failed: {e}")
+        return with_web_context(messages, [], images)
+    emit(type="sources", items=[{"title": r["title"], "url": r["url"]} for r in results])
+    return with_web_context(messages, results, images)
 
 
 # ---------------------------------------------------------------- local (MLX)
@@ -84,6 +229,8 @@ def worker():
     """Serve local chat requests: one JSON object per stdin line
     {"id", "handle", "messages", "max_tokens"}; reply with JSON lines
     {"id", "type": status|token|done|error, ...}. The model stays loaded between requests."""
+    import faulthandler
+    faulthandler.enable()  # on a hard crash, print a traceback to stderr so the app can show it
     out = sys.stdout
     sys.stdout = sys.stderr  # libraries print progress; keep stdout for protocol only
 
@@ -97,10 +244,15 @@ def worker():
         req = json.loads(line)
         rid, handle = req.get("id"), req.get("handle") or DEFAULTS["local"]
         try:
+            messages = req["messages"]
+            if req.get("search"):
+                messages = search_for_chat(messages, lambda **ev: emit(id=rid, **ev))
             if handle not in _loaded:
                 emit(id=rid, type="status", text=f"Loading {handle.split('/')[-1]} (first time downloads it)…")
+            else:
+                emit(id=rid, type="status", text="Thinking…")
             started = False
-            for chunk in stream_local(handle, req["messages"], int(req.get("max_tokens", 2048))):
+            for chunk in stream_local(handle, messages, int(req.get("max_tokens", 2048))):
                 if not started:
                     emit(id=rid, type="status", text=""); started = True
                 emit(id=rid, type="token", text=chunk)
@@ -227,8 +379,11 @@ def chat_remote():
     req = json.loads(sys.stdin.read())
     t0 = time.time()
     try:
+        messages = req["messages"]
+        if req.get("search"):
+            messages = search_for_chat(messages, emit)
         emit(type="status", text="Uploading notebook to Kaggle…")
-        kid = push(req.get("handle") or DEFAULTS["remote"], req["messages"],
+        kid = push(req.get("handle") or DEFAULTS["remote"], messages,
                    int(req.get("max_tokens", 2048)), req.get("slug") or "kllm-app")
         emit(type="status", text="Queued on Kaggle…", url=f"https://www.kaggle.com/code/{kid}")
         word = wait(kid, lambda s: emit(type="status", text=f"Kaggle: {s} · {int(time.time() - t0)}s",
